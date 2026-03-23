@@ -26,6 +26,8 @@ Store these values in `.env` for local development:
 AUTO_MATCH_API_BASE_URL=https://api.cencorpcms.net
 AUTO_MATCH_FRONTEND_BASE_URL=https://app.engageplatform.ai
 AUTO_MATCH_BEARER_TOKEN=your_cms_jwt_bearer_token
+AUTO_MATCH_ENGAGE_API_URL=https://api.engageplatform.ai/api/v1
+AUTO_MATCH_ENGAGE_BEARER_TOKEN=your_engage_bearer_token
 AUTO_MATCH_DEFAULT_LIMIT=20
 ```
 

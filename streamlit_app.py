@@ -77,6 +77,18 @@ st.markdown(
         background: #fee2e2;
         color: #991b1b;
       }
+      .badge-source-market {
+        background: #dcfce7;
+        color: #166534;
+      }
+      .badge-source-internal {
+        background: #ffedd5;
+        color: #9a3412;
+      }
+      .badge-source-unknown {
+        background: #e5e7eb;
+        color: #374151;
+      }
       .spec-grid {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -125,6 +137,8 @@ DEFAULT_CONFIG = {
     "api_base_url": get_secret("AUTO_MATCH_API_BASE_URL", ""),
     "frontend_base_url": get_secret("AUTO_MATCH_FRONTEND_BASE_URL", ""),
     "token": get_secret("AUTO_MATCH_BEARER_TOKEN", ""),
+    "engage_api_url": get_secret("AUTO_MATCH_ENGAGE_API_URL", ""),
+    "engage_token": get_secret("AUTO_MATCH_ENGAGE_BEARER_TOKEN", ""),
     "limit": int(get_secret("AUTO_MATCH_DEFAULT_LIMIT", "20") or "20"),
 }
 
@@ -207,16 +221,26 @@ def build_filter_payload(limit: int) -> dict[str, Any]:
 
 
 def request_json(path: str, token: str, preferences: dict[str, Any], filter_payload: dict[str, Any]) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    engage_api_url = normalize_base_url(st.session_state.engage_api_url)
+    engage_token = sanitize_token(st.session_state.engage_token)
+
+    if engage_api_url:
+        headers["x-engage-api-url"] = engage_api_url
+
+    if engage_token:
+        headers["x-engage-bearer-token"] = engage_token
+
     response = requests.get(
         join_url(st.session_state.api_base_url, path),
         params={
             "preferences": json.dumps(preferences),
             "filter": json.dumps(filter_payload),
         },
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
+        headers=headers,
         timeout=45,
     )
 
@@ -269,7 +293,51 @@ def get_image_url(item: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def get_api_listing_url(api_base_url: str, item_id: str) -> Optional[str]:
+def get_listing_source(item: dict[str, Any]) -> str:
+    source = clean_string(item.get("listingSource")).lower()
+    if source in {"market", "internal"}:
+        return source
+    return "unknown"
+
+
+def get_source_badge(item: dict[str, Any]) -> tuple[str, str]:
+    source = get_listing_source(item)
+    if source == "market":
+        return ("badge-source-market", "Market")
+    if source == "internal":
+        return ("badge-source-internal", "Internal")
+    return ("badge-source-unknown", "Unknown")
+
+
+def count_sources(items: list[dict[str, Any]]) -> Counter:
+    return Counter(get_listing_source(item) for item in items)
+
+
+def format_market_debug(payload: dict[str, Any]) -> str:
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    market_debug = meta.get("marketDebug") if isinstance(meta.get("marketDebug"), dict) else {}
+    source_counts = meta.get("sourceCounts") if isinstance(meta.get("sourceCounts"), dict) else {}
+
+    if not market_debug.get("enabled"):
+        return str(market_debug.get("reason") or "Disabled")
+
+    return " • ".join(
+        [
+            f"Internal {source_counts.get('internal', 0)}",
+            f"Market {source_counts.get('market', 0)}",
+            f"Fetched {market_debug.get('lastFetchReturned', 0)}/{market_debug.get('lastFetchTotal', 0)}",
+        ]
+    )
+
+
+def get_api_listing_url(api_base_url: str, item: dict[str, Any]) -> Optional[str]:
+    if get_listing_source(item) == "market":
+        links = item.get("_links") if isinstance(item.get("_links"), dict) else {}
+        if links.get("self"):
+            return str(links["self"])
+        return None
+
+    item_id = get_item_id(item)
     if not item_id:
         return None
     populate = json.dumps({"populate": "asset"})
@@ -278,6 +346,8 @@ def get_api_listing_url(api_base_url: str, item_id: str) -> Optional[str]:
 
 
 def build_public_listing_url(frontend_base_url: str, item: dict[str, Any]) -> Optional[str]:
+    if item.get("url"):
+        return str(item["url"])
     if not frontend_base_url or not item.get("slug"):
         return None
     asset = item.get("asset") if isinstance(item.get("asset"), dict) else {}
@@ -375,6 +445,7 @@ def render_summary(v1_payload: dict[str, Any], v2_payload: dict[str, Any], overl
         ("V2 Max Price", format_price_value(max_numeric_value(v2_items, "price"), v2_currency)),
         ("V1 Max Area", format_area(max_numeric_value(v1_items, "totalArea"))),
         ("V2 Max Area", format_area(max_numeric_value(v2_items, "totalArea"))),
+        ("V2 Market Debug", format_market_debug(v2_payload)),
     ]
 
     st.subheader("Summary")
@@ -383,9 +454,11 @@ def render_summary(v1_payload: dict[str, Any], v2_payload: dict[str, Any], overl
         cols[index % 3].metric(label, value)
 
 
-def render_badges(index: int, is_shared: bool, is_max_price: bool, is_max_area: bool) -> None:
+def render_badges(item: dict[str, Any], index: int, is_shared: bool, is_max_price: bool, is_max_area: bool) -> None:
+    source_class, source_label = get_source_badge(item)
     badges = [
         '<span class="badge badge-rank">#{}</span>'.format(index + 1),
+        '<span class="badge {}">{}</span>'.format(source_class, html.escape(source_label)),
         '<span class="badge {}">{}</span>'.format(
             "badge-shared" if is_shared else "badge-only",
             "Shared" if is_shared else "Only here",
@@ -454,7 +527,7 @@ def render_result_item(
         with right:
             st.markdown(f"#### {html.escape(str(title))}")
             st.caption(item.get("reference") or get_item_id(item))
-            render_badges(index, is_shared, is_max_price, is_max_area)
+            render_badges(item, index, is_shared, is_max_price, is_max_area)
             st.markdown(
                 f"**{format_price(item)}**  \n"
                 f"{bedrooms_text} • "
@@ -467,8 +540,17 @@ def render_result_item(
             )
             render_specs(item)
             public_url = build_public_listing_url(frontend_base_url, item)
-            if public_url:
+            api_url = get_api_listing_url(api_base_url, item)
+            if public_url and api_url:
+                first_link, second_link = st.columns(2, gap="small")
+                with first_link:
+                    st.link_button("Open listing", public_url, use_container_width=True)
+                with second_link:
+                    st.link_button("Open API JSON", api_url, use_container_width=True)
+            elif public_url:
                 st.link_button("Open listing", public_url, use_container_width=True)
+            elif api_url:
+                st.link_button("Open API JSON", api_url, use_container_width=True)
 
 
 def render_result_panel(
@@ -478,8 +560,16 @@ def render_result_panel(
     api_base_url: str,
     frontend_base_url: str,
 ) -> None:
+    source_counts = count_sources(items)
     st.subheader(title)
-    st.caption(f"{len(items)} rendered")
+    caption_parts = [f"{len(items)} rendered"]
+    if source_counts.get("internal"):
+        caption_parts.append(f"{source_counts['internal']} internal")
+    if source_counts.get("market"):
+        caption_parts.append(f"{source_counts['market']} market")
+    if source_counts.get("unknown"):
+        caption_parts.append(f"{source_counts['unknown']} unknown")
+    st.caption(" • ".join(caption_parts))
 
     if not items:
         st.info("No results returned.")
