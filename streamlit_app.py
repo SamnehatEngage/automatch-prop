@@ -1,6 +1,7 @@
 import html
 import json
 import os
+import re
 from collections import Counter
 from typing import Any, Optional, Union
 
@@ -293,15 +294,55 @@ def get_image_url(item: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def get_listing_source(item: dict[str, Any]) -> str:
-    source = clean_string(item.get("listingSource")).lower()
+def normalize_listing_source(value: Any) -> str:
+    source = clean_string(value).lower()
     if source in {"market", "internal"}:
         return source
     return "unknown"
 
 
-def get_source_badge(item: dict[str, Any]) -> tuple[str, str]:
-    source = get_listing_source(item)
+def looks_like_internal_listing(item: dict[str, Any]) -> bool:
+    item_id = clean_string(item.get("_id") or item.get("id"))
+    if re.fullmatch(r"[0-9a-fA-F]{24}", item_id):
+        return True
+    if clean_string(item.get("reference")) or clean_string(item.get("slug")):
+        return True
+    asset = item.get("asset")
+    return isinstance(asset, dict) and bool(asset)
+
+
+def looks_like_market_listing(item: dict[str, Any]) -> bool:
+    item_id = clean_string(item.get("_id") or item.get("id")).lower()
+    links = item.get("_links") if isinstance(item.get("_links"), dict) else {}
+    return bool(
+        clean_string(item.get("marketListingId"))
+        or item_id.startswith("market:")
+        or clean_string(item.get("portal"))
+        or clean_string(links.get("self"))
+    )
+
+
+def get_listing_source(item: dict[str, Any], default_source: Optional[str] = None) -> str:
+    for key in ("listingSource", "listing_source", "source", "sourceType"):
+        source = normalize_listing_source(item.get(key))
+        if source != "unknown":
+            return source
+
+    if looks_like_market_listing(item):
+        return "market"
+
+    if looks_like_internal_listing(item):
+        return "internal"
+
+    source = normalize_listing_source(default_source)
+    if source != "unknown":
+        return source
+
+    return "unknown"
+
+
+def get_source_badge(item: dict[str, Any], default_source: Optional[str] = None) -> tuple[str, str]:
+    source = get_listing_source(item, default_source)
     if source == "market":
         return ("badge-source-market", "Market")
     if source == "internal":
@@ -309,8 +350,29 @@ def get_source_badge(item: dict[str, Any]) -> tuple[str, str]:
     return ("badge-source-unknown", "Unknown")
 
 
-def count_sources(items: list[dict[str, Any]]) -> Counter:
-    return Counter(get_listing_source(item) for item in items)
+def count_sources(items: list[dict[str, Any]], default_source: Optional[str] = None) -> Counter:
+    return Counter(get_listing_source(item, default_source) for item in items)
+
+
+def get_source_counts(
+    payload: Optional[dict[str, Any]],
+    items: list[dict[str, Any]],
+    default_source: Optional[str] = None,
+) -> Counter:
+    counts = count_sources(items, default_source)
+    meta = payload.get("meta") if isinstance(payload, dict) and isinstance(payload.get("meta"), dict) else {}
+    source_counts = meta.get("sourceCounts") if isinstance(meta.get("sourceCounts"), dict) else {}
+
+    for source in ("internal", "market", "unknown"):
+        value = source_counts.get(source)
+        if isinstance(value, (int, float)):
+            counts[source] = int(value)
+
+    known_total = counts.get("internal", 0) + counts.get("market", 0)
+    if len(items) >= known_total:
+        counts["unknown"] = len(items) - known_total
+
+    return counts
 
 
 def format_market_debug(payload: dict[str, Any]) -> str:
@@ -330,8 +392,8 @@ def format_market_debug(payload: dict[str, Any]) -> str:
     )
 
 
-def get_api_listing_url(api_base_url: str, item: dict[str, Any]) -> Optional[str]:
-    if get_listing_source(item) == "market":
+def get_api_listing_url(api_base_url: str, item: dict[str, Any], default_source: Optional[str] = None) -> Optional[str]:
+    if get_listing_source(item, default_source) == "market":
         links = item.get("_links") if isinstance(item.get("_links"), dict) else {}
         if links.get("self"):
             return str(links["self"])
@@ -454,8 +516,15 @@ def render_summary(v1_payload: dict[str, Any], v2_payload: dict[str, Any], overl
         cols[index % 3].metric(label, value)
 
 
-def render_badges(item: dict[str, Any], index: int, is_shared: bool, is_max_price: bool, is_max_area: bool) -> None:
-    source_class, source_label = get_source_badge(item)
+def render_badges(
+    item: dict[str, Any],
+    index: int,
+    is_shared: bool,
+    is_max_price: bool,
+    is_max_area: bool,
+    default_source: Optional[str] = None,
+) -> None:
+    source_class, source_label = get_source_badge(item, default_source)
     badges = [
         '<span class="badge badge-rank">#{}</span>'.format(index + 1),
         '<span class="badge {}">{}</span>'.format(source_class, html.escape(source_label)),
@@ -502,6 +571,7 @@ def render_result_item(
     api_base_url: str,
     frontend_base_url: str,
     max_values: dict[str, Any],
+    default_source: Optional[str] = None,
 ) -> None:
     image_url = get_image_url(item)
     location_bits = [clean_string(item.get(key)) for key in ("city", "location", "subLocation", "community")]
@@ -527,7 +597,7 @@ def render_result_item(
         with right:
             st.markdown(f"#### {html.escape(str(title))}")
             st.caption(item.get("reference") or get_item_id(item))
-            render_badges(item, index, is_shared, is_max_price, is_max_area)
+            render_badges(item, index, is_shared, is_max_price, is_max_area, default_source)
             st.markdown(
                 f"**{format_price(item)}**  \n"
                 f"{bedrooms_text} • "
@@ -540,7 +610,7 @@ def render_result_item(
             )
             render_specs(item)
             public_url = build_public_listing_url(frontend_base_url, item)
-            api_url = get_api_listing_url(api_base_url, item)
+            api_url = get_api_listing_url(api_base_url, item, default_source)
             if public_url and api_url:
                 first_link, second_link = st.columns(2, gap="small")
                 with first_link:
@@ -559,8 +629,10 @@ def render_result_panel(
     other_map: dict[str, dict[str, Any]],
     api_base_url: str,
     frontend_base_url: str,
+    raw_payload: Optional[dict[str, Any]] = None,
+    default_source: Optional[str] = None,
 ) -> None:
-    source_counts = count_sources(items)
+    source_counts = get_source_counts(raw_payload, items, default_source)
     st.subheader(title)
     caption_parts = [f"{len(items)} rendered"]
     if source_counts.get("internal"):
@@ -588,6 +660,7 @@ def render_result_panel(
             api_base_url=api_base_url,
             frontend_base_url=frontend_base_url,
             max_values=max_values,
+            default_source=default_source,
         )
 
 
@@ -666,9 +739,24 @@ def render_results() -> None:
 
     left, right = st.columns(2, gap="large")
     with left:
-        render_result_panel("Auto-Match", v1_items, v2_map, api_base_url, frontend_base_url)
+        render_result_panel(
+            "Auto-Match",
+            v1_items,
+            v2_map,
+            api_base_url,
+            frontend_base_url,
+            raw_payload=v1_payload,
+            default_source="internal",
+        )
     with right:
-        render_result_panel("Auto-Match / v2", v2_items, v1_map, api_base_url, frontend_base_url)
+        render_result_panel(
+            "Auto-Match / v2",
+            v2_items,
+            v1_map,
+            api_base_url,
+            frontend_base_url,
+            raw_payload=v2_payload,
+        )
 
 
 def main() -> None:
